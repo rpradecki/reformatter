@@ -336,6 +336,12 @@ if uploaded:
     col3.metric("Term", data["term"])
     col4.metric("Year", data["year"])
 
+    with st.expander("Raw extracted text (for debugging)"):
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as _pdf:
+            for _i, _page in enumerate(_pdf.pages):
+                st.markdown(f"**Page {_i}**")
+                st.code(_page.extract_text() or "(empty)")
+
     if not data["subjects"]:
         st.error("No subjects found. Is this a Medbury effort card?")
         st.stop()
