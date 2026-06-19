@@ -53,25 +53,29 @@ def parse_effort_card(pdf_bytes: bytes) -> dict:
     """
     Extract student info and subject scores from a Medbury new-format PDF.
 
-    Returns a dict:
-        {
-            "student": "Alexander Radecki",
-            "year_level": "Year 8",
-            "term": 2,
-            "year": 2026,
-            "subjects": [("Reading", 4), ("Writing", 4), ...]
-        }
+    Normal format returns:
+        {"subjects": [("Reading", 4), ...], "split_term": False, ...}
+
+    Split-term format (Weeks 1-4 + Weeks 5-8 instead of a Term Average) returns:
+        {"subjects": [("Reading", 4, 3), ...], "split_term": True, ...}
     """
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        # --- Cover page: student info ---
         cover = pdf.pages[0].extract_text() or ""
         info = _parse_cover(cover)
 
-        # --- Subject pages (skip cover + grading key) ---
+        subject_pages_text = [page.extract_text() or "" for page in pdf.pages[2:]]
+
+        # Detect split-term: any page mentions "Weeks 5-8"
+        w58_pat = re.compile(r"Weeks\s+5[-–]8\s+\d", re.IGNORECASE)
+        split_term = any(w58_pat.search(t) for t in subject_pages_text)
+        info["split_term"] = split_term
+
         subjects = []
-        for page in pdf.pages[2:]:
-            text = page.extract_text() or ""
-            subjects.extend(_parse_subject_page(text, info["term"]))
+        for text in subject_pages_text:
+            if split_term:
+                subjects.extend(_parse_subject_page_split(text))
+            else:
+                subjects.extend(_parse_subject_page(text, info["term"]))
 
     info["subjects"] = subjects
     return info
@@ -156,6 +160,44 @@ def _find_term_score(lines: list, start: int, term: int) -> int | None:
     return fallback
 
 
+def _parse_subject_page_split(text: str) -> list:
+    """
+    Parse subject pages in split-term format (Weeks 1-4 + Weeks 5-8).
+    Returns [(subject_name, score_w14, score_w58), ...]
+    """
+    subjects = []
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+    for i, line in enumerate(lines):
+        if line != "Effort" or i < 2:
+            continue
+        subject_name = lines[i - 2]
+        if re.match(r"^\d", subject_name) or subject_name in ("Effort Card",):
+            continue
+        w14, w58 = _find_weeks_scores(lines, i + 1)
+        if w14 is not None or w58 is not None:
+            subjects.append((subject_name, w14, w58))
+
+    return subjects
+
+
+def _find_weeks_scores(lines: list, start: int) -> tuple:
+    """Return (weeks_1_4_score, weeks_5_8_score) from lines after 'Effort'."""
+    w14_pat = re.compile(r"Weeks\s+1[-–]4\s+(\d)", re.IGNORECASE)
+    w58_pat = re.compile(r"Weeks\s+5[-–]8\s+(\d)", re.IGNORECASE)
+    w14 = w58 = None
+    for j in range(start, min(start + 10, len(lines))):
+        m = w14_pat.match(lines[j])
+        if m and w14 is None:
+            s = int(m.group(1))
+            w14 = s if s in SCORE_COLORS else None
+        m = w58_pat.match(lines[j])
+        if m and w58 is None:
+            s = int(m.group(1))
+            w58 = s if s in SCORE_COLORS else None
+    return w14, w58
+
+
 # ---------------------------------------------------------------------------
 # PDF generation
 # ---------------------------------------------------------------------------
@@ -191,12 +233,21 @@ def build_color_pdf(data: dict) -> bytes:
     col_term  = 22 * mm
     col_widths = [col_subj] + [col_term] * 4
 
-    header = [""] + [Paragraph(f"<b>Term {i}</b>", th) for i in range(1, 5)]
-    nums   = [""] + [Paragraph(f"<b>{i}</b>", num)    for i in range(1, 5)]
+    split = data.get("split_term", False)
+
+    if split:
+        col_labels = ["Term 2.1", "Term 2.2", "Term 3", "Term 4"]
+        num_labels = ["2.1", "2.2", "3", "4"]
+    else:
+        col_labels = [f"Term {i}" for i in range(1, 5)]
+        num_labels = [str(i) for i in range(1, 5)]
+
+    header = [""] + [Paragraph(f"<b>{lbl}</b>", th) for lbl in col_labels]
+    nums   = [""] + [Paragraph(f"<b>{lbl}</b>", num) for lbl in num_labels]
 
     rows = [header, nums]
-    for name, _ in data["subjects"]:
-        rows.append([Paragraph(name, cell), "", "", "", ""])
+    for entry in data["subjects"]:
+        rows.append([Paragraph(entry[0], cell), "", "", "", ""])
 
     n_subj = len(data["subjects"])
     table = Table(
@@ -204,8 +255,6 @@ def build_color_pdf(data: dict) -> bytes:
         colWidths=col_widths,
         rowHeights=[10 * mm, 10 * mm] + [12 * mm] * n_subj,
     )
-
-    term_col = data["term"]  # Term 1 → col 1, Term 2 → col 2, etc.
 
     ts = TableStyle([
         ("GRID",        (0, 0), (-1, -1), 0.5, colors.black),
@@ -216,12 +265,23 @@ def build_color_pdf(data: dict) -> bytes:
         ("LEFTPADDING", (0, 0), (0,  -1), 4),
     ])
 
-    for i, (_, score) in enumerate(data["subjects"]):
+    for i, entry in enumerate(data["subjects"]):
         row = i + 2
-        ts.add("BACKGROUND", (term_col, row), (term_col, row), SCORE_COLORS[score])
-        for c in range(1, 5):
-            if c != term_col:
-                ts.add("BACKGROUND", (c, row), (c, row), colors.white)
+        if split:
+            # entry = (name, score_w14, score_w58); col 1 = w14, col 2 = w58
+            _, w14, w58 = entry
+            ts.add("BACKGROUND", (1, row), (1, row), SCORE_COLORS[w14] if w14 else colors.white)
+            ts.add("BACKGROUND", (2, row), (2, row), SCORE_COLORS[w58] if w58 else colors.white)
+            ts.add("BACKGROUND", (3, row), (3, row), colors.white)
+            ts.add("BACKGROUND", (4, row), (4, row), colors.white)
+        else:
+            # entry = (name, score); color the current term's column
+            _, score = entry
+            term_col = data["term"]
+            ts.add("BACKGROUND", (term_col, row), (term_col, row), SCORE_COLORS[score])
+            for c in range(1, 5):
+                if c != term_col:
+                    ts.add("BACKGROUND", (c, row), (c, row), colors.white)
 
     table.setStyle(ts)
     story.append(table)
@@ -281,9 +341,20 @@ if uploaded:
         st.stop()
 
     color_names = {1: "Red", 2: "Yellow", 3: "Green", 4: "Blue", 5: "Purple"}
-    rows = [{"Subject": s, "Score": sc, "Color": color_names.get(sc, str(sc))}
-            for s, sc in data["subjects"]]
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    if data.get("split_term"):
+        st.info("Split-term format detected: columns will show Term 2.1 (Weeks 1–4) and Term 2.2 (Weeks 5–8).")
+        table_rows = [
+            {"Subject": e[0],
+             "Term 2.1 Score": e[1], "Term 2.1 Color": color_names.get(e[1], "—"),
+             "Term 2.2 Score": e[2], "Term 2.2 Color": color_names.get(e[2], "—")}
+            for e in data["subjects"]
+        ]
+    else:
+        table_rows = [
+            {"Subject": e[0], "Score": e[1], "Color": color_names.get(e[1], str(e[1]))}
+            for e in data["subjects"]
+        ]
+    st.dataframe(table_rows, use_container_width=True, hide_index=True)
 
     with st.spinner("Building color-coded PDF…"):
         try:
