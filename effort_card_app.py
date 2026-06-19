@@ -63,21 +63,19 @@ def parse_effort_card(pdf_bytes: bytes) -> dict:
         cover = pdf.pages[0].extract_text() or ""
         info = _parse_cover(cover)
 
-        subject_pages_text = [page.extract_text() or "" for page in pdf.pages[2:]]
+        # Concatenate all subject pages into one block so that subjects whose
+        # scores overflow onto the next page are still parsed correctly.
+        combined = "\n".join(page.extract_text() or "" for page in pdf.pages[2:])
 
-        # Detect split-term: any page mentions "Weeks 5-8"
         w58_pat = re.compile(r"Weeks\s+5[-–]8\s+\d", re.IGNORECASE)
-        split_term = any(w58_pat.search(t) for t in subject_pages_text)
+        split_term = bool(w58_pat.search(combined))
         info["split_term"] = split_term
 
-        subjects = []
-        for text in subject_pages_text:
-            if split_term:
-                subjects.extend(_parse_subject_page_split(text))
-            else:
-                subjects.extend(_parse_subject_page(text, info["term"]))
+        if split_term:
+            info["subjects"] = _parse_subject_page_split(combined)
+        else:
+            info["subjects"] = _parse_subject_page(combined, info["term"])
 
-    info["subjects"] = subjects
     return info
 
 
@@ -109,20 +107,26 @@ def _parse_cover(text: str) -> dict:
     return {"student": student, "year_level": year_level, "term": term, "year": year}
 
 
+_INVALID_SUBJECT = re.compile(
+    r"^\d|average|weeks|end of year|effort", re.IGNORECASE
+)
+
+def _valid_subject(name: str) -> bool:
+    """Return True if the line looks like a real subject name."""
+    return bool(name) and not _INVALID_SUBJECT.search(name)
+
+
 def _parse_subject_page(text: str, term: int) -> list:
     """
-    Parse one page of subject blocks.
+    Parse subject blocks from the concatenated subject-page text.
 
-    Each block has this structure:
+    Each block:
         Subject Name      ← lines[i-2]
         Teacher Name      ← lines[i-1]
-        Effort            ← lines[i]  (our anchor)
+        Effort            ← lines[i]  (anchor)
         End of year average N
         Term N Average N
         Weeks 1-4 N
-
-    We anchor on the literal line "Effort" and look back two lines to find
-    the subject name, skipping the teacher name in between.
     """
     subjects = []
     lines = [l.strip() for l in text.splitlines() if l.strip()]
@@ -131,7 +135,7 @@ def _parse_subject_page(text: str, term: int) -> list:
         if line != "Effort" or i < 2:
             continue
         subject_name = lines[i - 2]
-        if re.match(r"^\d", subject_name) or subject_name in ("Effort Card",):
+        if not _valid_subject(subject_name):
             continue
         score = _find_term_score(lines, i + 1, term)
         if score is not None:
@@ -148,7 +152,7 @@ def _find_term_score(lines: list, start: int, term: int) -> int | None:
     term_pat  = re.compile(rf"Term\s+{term}\s+Average\s+(\d)", re.IGNORECASE)
     weeks_pat = re.compile(r"Weeks\s+1[-–]4\s+(\d)", re.IGNORECASE)
     fallback = None
-    for j in range(start, min(start + 8, len(lines))):
+    for j in range(start, min(start + 12, len(lines))):
         m = term_pat.match(lines[j])
         if m:
             score = int(m.group(1))
@@ -162,7 +166,7 @@ def _find_term_score(lines: list, start: int, term: int) -> int | None:
 
 def _parse_subject_page_split(text: str) -> list:
     """
-    Parse subject pages in split-term format (Weeks 1-4 + Weeks 5-8).
+    Parse split-term blocks (Weeks 1-4 + Weeks 5-8).
     Returns [(subject_name, score_w14, score_w58), ...]
     """
     subjects = []
@@ -172,7 +176,7 @@ def _parse_subject_page_split(text: str) -> list:
         if line != "Effort" or i < 2:
             continue
         subject_name = lines[i - 2]
-        if re.match(r"^\d", subject_name) or subject_name in ("Effort Card",):
+        if not _valid_subject(subject_name):
             continue
         w14, w58 = _find_weeks_scores(lines, i + 1)
         if w14 is not None or w58 is not None:
@@ -186,7 +190,7 @@ def _find_weeks_scores(lines: list, start: int) -> tuple:
     w14_pat = re.compile(r"Weeks\s+1[-–]4\s+(\d)", re.IGNORECASE)
     w58_pat = re.compile(r"Weeks\s+5[-–]8\s+(\d)", re.IGNORECASE)
     w14 = w58 = None
-    for j in range(start, min(start + 10, len(lines))):
+    for j in range(start, min(start + 12, len(lines))):
         m = w14_pat.match(lines[j])
         if m and w14 is None:
             s = int(m.group(1))
